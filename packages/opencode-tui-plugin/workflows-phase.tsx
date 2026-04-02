@@ -60,6 +60,14 @@ interface MessageUpdatedEvent {
   };
 }
 
+interface CommandExecutedEvent {
+  properties?: {
+    name?: string;
+    sessionID?: string;
+    arguments?: string;
+  };
+}
+
 /**
  * Extract ordered phase names from a workflow YAML file without a YAML parser.
  *
@@ -253,6 +261,9 @@ function parseActiveAgentFilter(): Set<string> | null {
   );
 }
 
+// Module-level map so session overrides survive sidebar remounts.
+const sessionOverrideMap = new Map<string, boolean>();
+
 // eslint-disable-next-line @typescript-eslint/require-await -- TuiPlugin signature requires Promise<void>; plugin body is synchronous
 const tui: TuiPlugin = async api => {
   const activeAgentFilter = parseActiveAgentFilter();
@@ -272,6 +283,13 @@ const tui: TuiPlugin = async api => {
         } | null>(null);
         const [collapsed, setCollapsed] = createSignal(false);
 
+        // Per-session override from /workflow on|off commands.
+        // Backed by module-level map so it survives sidebar remounts.
+        // null = no override (fall back to agent filter).
+        const [sessionOverride, setSessionOverride] = createSignal<
+          boolean | null
+        >(sessionOverrideMap.get(props.session_id) ?? null);
+
         // Derive the current agent for this session from the last message.
         // api.state.session.messages() is a reactive SolidJS accessor.
         const currentAgent = createMemo(() => {
@@ -285,8 +303,13 @@ const tui: TuiPlugin = async api => {
           return undefined;
         });
 
-        // Derive whether the widget should be visible based on the agent filter.
+        // Derive whether the widget should be visible based on agent filter +
+        // per-session override from /workflow on|off.
         const isActive = createMemo(() => {
+          const override = sessionOverride();
+          if (override === false) return false; // explicitly disabled
+          if (override === true) return true; // explicitly enabled
+          // No override: apply agent filter
           if (activeAgentFilter === null) return true; // no filter → always active
           const agent = currentAgent();
           if (agent === undefined) return false; // filter set but agent unknown → hide
@@ -338,6 +361,23 @@ const tui: TuiPlugin = async api => {
           setState(stateBySession);
         });
         onCleanup(offPart);
+
+        // Listen for /workflow on|off commands to toggle visibility.
+        const offCmd = api.event.on('command.executed', e => {
+          const ev = e as CommandExecutedEvent;
+          if (ev.properties?.sessionID !== props.session_id) return;
+          const name = ev.properties?.name?.toLowerCase();
+          if (name !== 'workflow' && name !== 'wf') return;
+          const args = ev.properties?.arguments?.toLowerCase().trim();
+          if (args === 'on') {
+            sessionOverrideMap.set(props.session_id, true);
+            setSessionOverride(true);
+          } else if (args === 'off') {
+            sessionOverrideMap.set(props.session_id, false);
+            setSessionOverride(false);
+          }
+        });
+        onCleanup(offCmd);
 
         // Also refresh state when the agent changes (e.g. subagent session becomes active)
         let lastAgent: string | undefined;
