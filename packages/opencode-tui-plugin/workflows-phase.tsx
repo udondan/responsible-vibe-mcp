@@ -340,9 +340,14 @@ const tui: TuiPlugin = async api => {
         onCleanup(offPart);
 
         // Also refresh state when the agent changes (e.g. subagent session becomes active)
+        let lastAgent: string | undefined;
         const offMsg = api.event.on('message.updated', e => {
           const ev = e as MessageUpdatedEvent;
           if (ev.properties?.sessionID !== props.session_id) return;
+          const agent = ev.properties?.info?.agent as string | undefined;
+          // Only refresh when agent information is present and has changed
+          if (!agent || agent === lastAgent) return;
+          lastAgent = agent;
           if (!dir) return;
           const stateBySession = readStateBySessionId(dir, props.session_id);
           setState(stateBySession);
