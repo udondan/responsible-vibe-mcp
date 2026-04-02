@@ -94,13 +94,15 @@ When the env var is set, workflow hooks and edit restrictions are skipped for an
 
 ### Session override
 
-Use the `/workflow` command to toggle the plugin on or off for the current session only, regardless of the agent filter:
+Use the `/workflow` command to toggle the plugin on or off for the current session, regardless of the agent filter:
 
 ```
 /workflow off   # disable for this session
-/workflow on    # re-enable for this session
+/workflow on    # enable for this session (overrides WORKFLOW_ACTIVE_AGENTS filter)
 /workflow       # show current state
 ```
+
+`/workflow on` acts as a full escape hatch — it forces workflows active even if the current agent is not listed in `WORKFLOW_ACTIVE_AGENTS`.
 
 ## Related
 
