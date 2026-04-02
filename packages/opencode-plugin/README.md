@@ -90,7 +90,7 @@ By default the plugin is active for all agents. Set `WORKFLOW_ACTIVE_AGENTS` to 
 WORKFLOW_ACTIVE_AGENTS=coder,architect
 ```
 
-When the env var is set, hooks and tool-call enforcement are silently skipped for any agent not in the list. This prevents subagents (Tasks) from being interrupted by workflow instructions when they are not expected to follow the workflow.
+When the env var is set, workflow hooks and edit restrictions are skipped for any agent not in the list. Workflow tools are still registered, and calling them from an inactive agent will result in an error. This prevents subagents (Tasks) from being interrupted by workflow instructions when they are not expected to follow the workflow.
 
 ### Session override
 
