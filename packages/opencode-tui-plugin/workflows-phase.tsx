@@ -289,7 +289,7 @@ const tui: TuiPlugin = async api => {
         const isActive = createMemo(() => {
           if (activeAgentFilter === null) return true; // no filter → always active
           const agent = currentAgent();
-          if (agent === undefined) return true; // no messages yet → show optimistically
+          if (agent === undefined) return false; // filter set but agent unknown → hide
           return activeAgentFilter.has(agent);
         });
 
