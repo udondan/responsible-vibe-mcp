@@ -127,7 +127,6 @@ export const WorkflowsPlugin: Plugin = async (
             .filter(Boolean)
         )
       : null; // null = no filter, all agents active
-
   // Session-level override: /workflow on|off works on top of the agent filter.
   // Starts as true so the agent filter alone controls whether hooks fire.
   let workflowsEnabled = true;
@@ -303,7 +302,7 @@ export const WorkflowsPlugin: Plugin = async (
 
       // Skip if workflows are disabled or agent is not in the active list
       if (!isActiveForAgent(hookInput.agent)) {
-        logger.info(
+        logger.debug(
           'chat.message: Workflows inactive for agent, skipping hook',
           { agent: hookInput.agent }
         );

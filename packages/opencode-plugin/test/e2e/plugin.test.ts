@@ -744,150 +744,290 @@ describe('File Pattern Restrictions', () => {
   }
 });
 
-describe('WORKFLOW=off environment variable', () => {
-  it('registers tools when WORKFLOW=off, but execute throws a clear disabled error', async () => {
-    const dir = createTempDir();
-    const originalEnv = process.env.WORKFLOW;
-    try {
-      process.env.WORKFLOW = 'off';
+describe('WORKFLOW_ACTIVE_AGENTS environment variable', () => {
+  let dir: string;
+  let originalEnv: string | undefined;
 
-      const hooks = await WorkflowsPlugin(createMockPluginInput(dir));
-
-      // Tools are still registered (so /workflow on can re-enable them)
-      expect(hooks.tool).toBeDefined();
-      expect(hooks.tool).toHaveProperty('start_development');
-      expect(hooks.tool).toHaveProperty('proceed_to_phase');
-      expect(hooks.tool).toHaveProperty('conduct_review');
-      expect(hooks.tool).toHaveProperty('reset_development');
-      expect(hooks.tool).toHaveProperty('setup_project_docs');
-
-      // But executing a tool throws with a clear message
-      await expect(
-        hooks.tool!['start_development'].execute({ workflow: 'minor' }, {
-          sessionID: 'test-session',
-        } as unknown)
-      ).rejects.toThrow(/disabled/i);
-
-      // Command hook is available for toggling
-      expect(hooks['command.execute.before']).toBeDefined();
-    } finally {
-      if (originalEnv === undefined) {
-        delete process.env.WORKFLOW;
-      } else {
-        process.env.WORKFLOW = originalEnv;
-      }
-      cleanupDir(dir);
-    }
+  beforeEach(() => {
+    dir = createTempDir();
+    originalEnv = process.env.WORKFLOW_ACTIVE_AGENTS;
   });
 
-  it('allows tool execution after /wf on when started with WORKFLOW=off', async () => {
-    const dir = createTempDir();
-    const originalEnv = process.env.WORKFLOW;
-    try {
-      process.env.WORKFLOW = 'off';
+  afterEach(() => {
+    if (originalEnv === undefined) {
+      delete process.env.WORKFLOW_ACTIVE_AGENTS;
+    } else {
+      process.env.WORKFLOW_ACTIVE_AGENTS = originalEnv;
+    }
+    cleanupDir(dir);
+  });
 
-      const hooks = await WorkflowsPlugin(createMockPluginInput(dir));
+  it('activates for all agents when WORKFLOW_ACTIVE_AGENTS is not set', async () => {
+    delete process.env.WORKFLOW_ACTIVE_AGENTS;
 
-      // Confirm disabled initially
-      await expect(
-        hooks.tool!['start_development'].execute({ workflow: 'minor' }, {
-          sessionID: 'test-session',
-        } as unknown)
-      ).rejects.toThrow(/disabled/i);
+    await setupWorkflowState(dir, {
+      workflowName: 'epcc',
+      currentPhase: 'explore',
+    });
+    const hooks = await WorkflowsPlugin(createMockPluginInput(dir));
 
-      // Toggle on via command
-      const output: { parts: Part[] } = { parts: [] };
-      await hooks['command.execute.before']!(
-        { command: 'workflow', arguments: 'on', sessionID: 'test-session' },
+    const mockMessage: UserMessage = {
+      id: 'msg-1',
+      sessionID: 'sess-1',
+      role: 'user',
+    };
+    const output = { message: mockMessage, parts: [] as Part[] };
+
+    // Any agent (including unlisted ones) should get instructions injected
+    await hooks['chat.message']!(
+      { sessionID: 'sess-1', agent: 'build' },
+      output
+    );
+    expect(output.parts.length).toBeGreaterThan(0);
+  });
+
+  it('skips chat.message hook for agents not in the filter list', async () => {
+    process.env.WORKFLOW_ACTIVE_AGENTS = 'vibe';
+
+    await setupWorkflowState(dir, {
+      workflowName: 'epcc',
+      currentPhase: 'explore',
+    });
+    const hooks = await WorkflowsPlugin(createMockPluginInput(dir));
+
+    const mockMessage: UserMessage = {
+      id: 'msg-1',
+      sessionID: 'sess-1',
+      role: 'user',
+    };
+    const output = { message: mockMessage, parts: [] as Part[] };
+
+    // 'build' is not in the active agents list → hook should skip
+    await hooks['chat.message']!(
+      { sessionID: 'sess-1', agent: 'build' },
+      output
+    );
+    expect(output.parts.length).toBe(0);
+  });
+
+  it('injects instructions for agents that are in the filter list', async () => {
+    process.env.WORKFLOW_ACTIVE_AGENTS = 'vibe';
+
+    await setupWorkflowState(dir, {
+      workflowName: 'epcc',
+      currentPhase: 'explore',
+    });
+    const hooks = await WorkflowsPlugin(createMockPluginInput(dir));
+
+    const mockMessage: UserMessage = {
+      id: 'msg-1',
+      sessionID: 'sess-1',
+      role: 'user',
+    };
+    const output = { message: mockMessage, parts: [] as Part[] };
+
+    // 'vibe' is in the active agents list → instructions should be injected
+    await hooks['chat.message']!(
+      { sessionID: 'sess-1', agent: 'vibe' },
+      output
+    );
+    expect(output.parts.length).toBeGreaterThan(0);
+  });
+
+  it('is case-insensitive when matching agent names', async () => {
+    process.env.WORKFLOW_ACTIVE_AGENTS = 'Vibe';
+
+    await setupWorkflowState(dir, {
+      workflowName: 'epcc',
+      currentPhase: 'explore',
+    });
+    const hooks = await WorkflowsPlugin(createMockPluginInput(dir));
+
+    const mockMessage: UserMessage = {
+      id: 'msg-1',
+      sessionID: 'sess-1',
+      role: 'user',
+    };
+    const output = { message: mockMessage, parts: [] as Part[] };
+
+    // 'VIBE' (uppercase from runtime) should match 'Vibe' in env var
+    await hooks['chat.message']!(
+      { sessionID: 'sess-1', agent: 'VIBE' },
+      output
+    );
+    expect(output.parts.length).toBeGreaterThan(0);
+  });
+
+  it('supports multiple agents in comma-separated list', async () => {
+    process.env.WORKFLOW_ACTIVE_AGENTS = 'vibe, dev, build';
+
+    await setupWorkflowState(dir, {
+      workflowName: 'epcc',
+      currentPhase: 'explore',
+    });
+    const hooks = await WorkflowsPlugin(createMockPluginInput(dir));
+
+    for (const agent of ['vibe', 'dev', 'build']) {
+      const mockMessage: UserMessage = {
+        id: `msg-${agent}`,
+        sessionID: `sess-${agent}`,
+        role: 'user',
+      };
+      const output = { message: mockMessage, parts: [] as Part[] };
+      await hooks['chat.message']!(
+        { sessionID: `sess-${agent}`, agent },
         output
       );
-      expect(
-        output.parts[0]?.type === 'text' && output.parts[0].text
-      ).toContain('enabled');
-
-      // Now the tool should no longer throw the disabled error
-      // (it may fail for other reasons like no plan file, but not the disabled guard)
-      let thrownMessage: string | undefined;
-      try {
-        await hooks.tool!['start_development'].execute({ workflow: 'minor' }, {
-          sessionID: 'test-session',
-        } as unknown);
-      } catch (err) {
-        thrownMessage = (err as Error).message;
-      }
-      // If it did throw, it must NOT be the disabled message
-      if (thrownMessage !== undefined) {
-        expect(thrownMessage).not.toMatch(/disabled/i);
-      }
-    } finally {
-      if (originalEnv === undefined) {
-        delete process.env.WORKFLOW;
-      } else {
-        process.env.WORKFLOW = originalEnv;
-      }
-      cleanupDir(dir);
+      expect(output.parts.length).toBeGreaterThan(0);
     }
   });
 
-  it('loads all tools and hooks when WORKFLOW is not set (default)', async () => {
-    const dir = createTempDir();
-    const originalEnv = process.env.WORKFLOW;
+  it('throws agent-inactive error when tool is called by an inactive agent', async () => {
+    process.env.WORKFLOW_ACTIVE_AGENTS = 'vibe';
+
+    const hooks = await WorkflowsPlugin(createMockPluginInput(dir));
+
+    // 'build' is not in the active agents list
+    await expect(
+      hooks.tool!['start_development'].execute({ workflow: 'epcc' }, {
+        agent: 'build',
+        sessionID: 'sess-1',
+      } as never)
+    ).rejects.toThrow(/not active/i);
+  });
+
+  it('allows tool execution for agents in the filter list', async () => {
+    process.env.WORKFLOW_ACTIVE_AGENTS = 'vibe';
+
+    const hooks = await WorkflowsPlugin(createMockPluginInput(dir));
+
+    // 'vibe' is in the active agents list — should not throw the agent-inactive error
+    let thrownMessage: string | undefined;
     try {
-      delete process.env.WORKFLOW;
-
-      const hooks = await WorkflowsPlugin(createMockPluginInput(dir));
-
-      // When WORKFLOW is not set, all hooks and tools should be registered
-      expect(hooks['chat.message']).toBeDefined();
-      expect(hooks['tool.execute.before']).toBeDefined();
-      expect(hooks['experimental.session.compacting']).toBeDefined();
-      expect(hooks['command.execute.before']).toBeDefined();
-      expect(hooks.tool).toBeDefined();
-
-      // Tools should be populated
-      expect(hooks.tool).toHaveProperty('start_development');
-      expect(hooks.tool).toHaveProperty('proceed_to_phase');
-      expect(hooks.tool).toHaveProperty('conduct_review');
-      expect(hooks.tool).toHaveProperty('reset_development');
-      expect(hooks.tool).toHaveProperty('setup_project_docs');
-    } finally {
-      if (originalEnv === undefined) {
-        delete process.env.WORKFLOW;
-      } else {
-        process.env.WORKFLOW = originalEnv;
-      }
-      cleanupDir(dir);
+      await hooks.tool!['start_development'].execute({ workflow: 'epcc' }, {
+        agent: 'vibe',
+        sessionID: 'sess-1',
+      } as never);
+    } catch (err) {
+      thrownMessage = (err as Error).message;
+    }
+    // If it threw, it must not be the agent-inactive error
+    if (thrownMessage !== undefined) {
+      expect(thrownMessage).not.toMatch(/not active/i);
     }
   });
 
-  it('loads all tools and hooks when WORKFLOW=on', async () => {
-    const dir = createTempDir();
-    const originalEnv = process.env.WORKFLOW;
-    try {
-      process.env.WORKFLOW = 'on';
+  it('skips tool.execute.before for inactive agents (no file blocking)', async () => {
+    process.env.WORKFLOW_ACTIVE_AGENTS = 'vibe';
 
-      const hooks = await WorkflowsPlugin(createMockPluginInput(dir));
+    await setupWorkflowState(dir, {
+      workflowName: 'epcc',
+      currentPhase: 'explore',
+    });
+    const hooks = await WorkflowsPlugin(createMockPluginInput(dir));
 
-      // When WORKFLOW=on, all hooks and tools should be registered
-      expect(hooks['chat.message']).toBeDefined();
-      expect(hooks['tool.execute.before']).toBeDefined();
-      expect(hooks['experimental.session.compacting']).toBeDefined();
-      expect(hooks['command.execute.before']).toBeDefined();
-      expect(hooks.tool).toBeDefined();
+    // First, register the agent via chat.message so sessionAgents is populated
+    const mockMessage: UserMessage = {
+      id: 'msg-1',
+      sessionID: 'sess-build',
+      role: 'user',
+    };
+    await hooks['chat.message']!(
+      { sessionID: 'sess-build', agent: 'build' },
+      { message: mockMessage, parts: [] as Part[] }
+    );
 
-      // Tools should be populated
-      expect(hooks.tool).toHaveProperty('start_development');
-      expect(hooks.tool).toHaveProperty('proceed_to_phase');
-      expect(hooks.tool).toHaveProperty('conduct_review');
-      expect(hooks.tool).toHaveProperty('reset_development');
-      expect(hooks.tool).toHaveProperty('setup_project_docs');
-    } finally {
-      if (originalEnv === undefined) {
-        delete process.env.WORKFLOW;
-      } else {
-        process.env.WORKFLOW = originalEnv;
-      }
-      cleanupDir(dir);
-    }
+    // Now try an edit that would be blocked in explore phase — but agent is 'build' (inactive)
+    // so the hook should skip and NOT throw
+    await expect(
+      hooks['tool.execute.before']!(
+        { tool: 'edit', sessionID: 'sess-build', callID: 'call-1' },
+        { args: { filePath: '/some/file.ts', oldString: 'a', newString: 'b' } }
+      )
+    ).resolves.not.toThrow();
+  });
+
+  it('injects system prompt suppression for inactive agents', async () => {
+    process.env.WORKFLOW_ACTIVE_AGENTS = 'vibe';
+
+    const hooks = await WorkflowsPlugin(createMockPluginInput(dir));
+
+    // Seed sessionAgents by firing chat.message for an inactive agent
+    const mockMessage: UserMessage = {
+      id: 'msg-1',
+      sessionID: 'sess-build',
+      role: 'user',
+    };
+    await hooks['chat.message']!(
+      { sessionID: 'sess-build', agent: 'build' },
+      { message: mockMessage, parts: [] as Part[] }
+    );
+
+    const systemOutput = { system: [] as string[] };
+    await hooks['experimental.chat.system.transform']!(
+      { sessionID: 'sess-build', model: { providerID: 'x', modelID: 'y' } },
+      systemOutput
+    );
+
+    // Should inject a suppression instruction for the inactive agent
+    expect(systemOutput.system.length).toBeGreaterThan(0);
+    expect(systemOutput.system.some(s => s.includes('start_development'))).toBe(
+      true
+    );
+  });
+
+  it('does NOT inject system prompt suppression for active agents', async () => {
+    process.env.WORKFLOW_ACTIVE_AGENTS = 'vibe';
+
+    const hooks = await WorkflowsPlugin(createMockPluginInput(dir));
+
+    // Seed sessionAgents by firing chat.message for the active agent
+    const mockMessage: UserMessage = {
+      id: 'msg-1',
+      sessionID: 'sess-vibe',
+      role: 'user',
+    };
+    await hooks['chat.message']!(
+      { sessionID: 'sess-vibe', agent: 'vibe' },
+      { message: mockMessage, parts: [] as Part[] }
+    );
+
+    const systemOutput = { system: [] as string[] };
+    await hooks['experimental.chat.system.transform']!(
+      { sessionID: 'sess-vibe', model: { providerID: 'x', modelID: 'y' } },
+      systemOutput
+    );
+
+    // Active agent should NOT get the suppression instruction
+    expect(systemOutput.system.length).toBe(0);
+  });
+
+  it('/workflow off disables hooks even for agents in the active list', async () => {
+    process.env.WORKFLOW_ACTIVE_AGENTS = 'vibe';
+
+    await setupWorkflowState(dir, {
+      workflowName: 'epcc',
+      currentPhase: 'explore',
+    });
+    const hooks = await WorkflowsPlugin(createMockPluginInput(dir));
+
+    // Disable via command
+    await hooks['command.execute.before']!(
+      { command: 'workflow', arguments: 'off', sessionID: 'sess-vibe' },
+      { parts: [] as Part[] }
+    );
+
+    // Even 'vibe' (active agent) should now be skipped
+    const mockMessage: UserMessage = {
+      id: 'msg-1',
+      sessionID: 'sess-vibe',
+      role: 'user',
+    };
+    const output = { message: mockMessage, parts: [] as Part[] };
+    await hooks['chat.message']!(
+      { sessionID: 'sess-vibe', agent: 'vibe' },
+      output
+    );
+    expect(output.parts.length).toBe(0);
   });
 });
