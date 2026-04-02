@@ -155,9 +155,12 @@ export const WorkflowsPlugin: Plugin = async (
   }
 
   /**
-   * Set per-session enabled state, pruning oldest entries if the map grows too large.
+   * Set per-session enabled state with LRU eviction.
+   * Deletes and re-inserts the key to refresh insertion order, so recently
+   * used sessions are never evicted before truly idle ones.
    */
   function setSessionEnabled(sessionID: string, value: boolean): void {
+    sessionEnabled.delete(sessionID);
     sessionEnabled.set(sessionID, value);
     if (sessionEnabled.size > MAX_TRACKED_SESSIONS) {
       const oldest = sessionEnabled.keys().next().value;
@@ -196,9 +199,11 @@ export const WorkflowsPlugin: Plugin = async (
   const sessionAgents = new Map<string, string>();
 
   /**
-   * Record the agent for a session, pruning oldest entry if map grows too large.
+   * Record the agent for a session with LRU eviction.
+   * Deletes and re-inserts the key to refresh insertion order.
    */
   function setSessionAgent(sessionID: string, agent: string): void {
+    sessionAgents.delete(sessionID);
     sessionAgents.set(sessionID, agent);
     if (sessionAgents.size > MAX_TRACKED_SESSIONS) {
       const oldest = sessionAgents.keys().next().value;

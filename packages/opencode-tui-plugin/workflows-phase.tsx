@@ -345,9 +345,12 @@ const tui: TuiPlugin = async api => {
           const ev = e as MessageUpdatedEvent;
           if (ev.properties?.sessionID !== props.session_id) return;
           const agent = ev.properties?.info?.agent as string | undefined;
-          // Only refresh when agent information is present and has changed
-          if (!agent || agent === lastAgent) return;
-          lastAgent = agent;
+          // Only refresh when agent information is present and has changed.
+          // Normalize to lowercase to match the filter and currentAgent() comparison.
+          if (!agent) return;
+          const normalizedAgent = agent.toLowerCase();
+          if (normalizedAgent === lastAgent) return;
+          lastAgent = normalizedAgent;
           if (!dir) return;
           const stateBySession = readStateBySessionId(dir, props.session_id);
           setState(stateBySession);
