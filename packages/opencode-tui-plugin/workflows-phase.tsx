@@ -51,6 +51,15 @@ interface MessagePartUpdatedEvent {
   };
 }
 
+interface MessageUpdatedEvent {
+  properties?: {
+    sessionID?: string;
+    info?: {
+      agent?: string;
+    };
+  };
+}
+
 /**
  * Extract ordered phase names from a workflow YAML file without a YAML parser.
  *
@@ -229,10 +238,26 @@ function readStateBySessionId(
   }
 }
 
+/**
+ * Parse the WORKFLOW_ACTIVE_AGENTS env var into a Set of lowercase agent names,
+ * or null if unset/empty (meaning all agents are active).
+ */
+function parseActiveAgentFilter(): Set<string> | null {
+  const raw = process.env.WORKFLOW_ACTIVE_AGENTS;
+  if (!raw || !raw.trim()) return null;
+  return new Set(
+    raw
+      .split(',')
+      .map(a => a.trim().toLowerCase())
+      .filter(Boolean)
+  );
+}
+
 // eslint-disable-next-line @typescript-eslint/require-await -- TuiPlugin signature requires Promise<void>; plugin body is synchronous
 const tui: TuiPlugin = async api => {
-  // Respect the WORKFLOW env var used by the opencode-plugin.
-  // Set WORKFLOW=off to disable the TUI sidebar widget.
+  const activeAgentFilter = parseActiveAgentFilter();
+
+  // Respect legacy WORKFLOW=off env var as well.
   if (process.env.WORKFLOW?.toLowerCase() === 'off') return;
 
   api.slots.register({
@@ -246,6 +271,27 @@ const tui: TuiPlugin = async api => {
           phases: string[];
         } | null>(null);
         const [collapsed, setCollapsed] = createSignal(false);
+
+        // Derive the current agent for this session from the last message.
+        // api.state.session.messages() is a reactive SolidJS accessor.
+        const currentAgent = createMemo(() => {
+          const messages = api.state.session.messages(props.session_id);
+          if (!messages || messages.length === 0) return undefined;
+          // Walk backwards to find the most recent message with an agent field
+          for (let i = messages.length - 1; i >= 0; i--) {
+            const msg = messages[i] as { agent?: string };
+            if (msg.agent) return msg.agent.toLowerCase();
+          }
+          return undefined;
+        });
+
+        // Derive whether the widget should be visible based on the agent filter.
+        const isActive = createMemo(() => {
+          if (activeAgentFilter === null) return true; // no filter → always active
+          const agent = currentAgent();
+          if (agent === undefined) return true; // no messages yet → show optimistically
+          return activeAgentFilter.has(agent);
+        });
 
         // Spinner frames for the current-phase icon
         const SPINNER = ['◐', '◓', '◑', '◒'];
@@ -293,19 +339,49 @@ const tui: TuiPlugin = async api => {
         });
         onCleanup(offPart);
 
+        // Also refresh state when the agent changes (e.g. subagent session becomes active)
+        const offMsg = api.event.on('message.updated', e => {
+          const ev = e as MessageUpdatedEvent;
+          if (ev.properties?.sessionID !== props.session_id) return;
+          if (!dir) return;
+          const stateBySession = readStateBySessionId(dir, props.session_id);
+          setState(stateBySession);
+        });
+        onCleanup(offMsg);
+
         // eslint-disable-next-line @typescript-eslint/no-unsafe-return -- JSX element typed as `error` by @opentui/solid's JSX types; safe at runtime
         return (
-          <box flexDirection="column">
-            {/* Header row — clickable to collapse/expand when an active workflow is present */}
-            <text
-              fg={theme().text}
-              onMouseDown={() => state() && setCollapsed(c => !c)}
-            >
-              {state() ? (
-                (state()?.phases ?? []).length === 0 ? (
-                  // Phases unknown
-                  collapsed() ? (
-                    // Collapsed: ▶ workflowName phaseName
+          // Return null (no DOM node at all) when the agent filter excludes this session's agent.
+          // Returning an empty <box> would still occupy a line in the sidebar.
+          !isActive() ? null : (
+            <box flexDirection="column">
+              {/* Header row — clickable to collapse/expand when an active workflow is present */}
+              <text
+                fg={theme().text}
+                onMouseDown={() => state() && setCollapsed(c => !c)}
+              >
+                {state() ? (
+                  (state()?.phases ?? []).length === 0 ? (
+                    // Phases unknown
+                    collapsed() ? (
+                      // Collapsed: ▶ workflowName phaseName
+                      <span>
+                        {'▶ '}
+                        <b>{state()?.workflow}</b>
+                        <span style={{ fg: theme().textMuted }}>
+                          {' '}
+                          {state()?.phase}
+                        </span>
+                      </span>
+                    ) : (
+                      // Expanded: ▼ Workflow (body shows workflowName phaseName)
+                      <span>
+                        {'▼ '}
+                        <b>Workflow</b>
+                      </span>
+                    )
+                  ) : collapsed() ? (
+                    // Collapsed + active: ▶ workflowName phaseName
                     <span>
                       {'▶ '}
                       <b>{state()?.workflow}</b>
@@ -315,78 +391,62 @@ const tui: TuiPlugin = async api => {
                       </span>
                     </span>
                   ) : (
-                    // Expanded: ▼ Workflow (body shows workflowName phaseName)
+                    // Expanded + active: ▼ Workflow workflowName
                     <span>
                       {'▼ '}
-                      <b>Workflow</b>
+                      <b>Workflow</b> {state()?.workflow}
                     </span>
                   )
-                ) : collapsed() ? (
-                  // Collapsed + active: ▶ workflowName phaseName
-                  <span>
-                    {'▶ '}
+                ) : (
+                  // No active workflow
+                  // eslint-disable-next-line solid/style-prop -- `fg` is an OpenTUI-specific style prop, not a standard CSS property
+                  <b>Workflow</b>
+                )}
+              </text>
+              {/* Expanded phase list */}
+              {!collapsed() && state() ? (
+                (state()?.phases ?? []).length > 0 ? (
+                  <box flexDirection="column">
+                    <Index each={state()?.phases ?? []}>
+                      {(phase, index) => (
+                        <text
+                          fg={
+                            phase() === state()?.phase
+                              ? theme().warning
+                              : currentPhaseIndex() >= 0 &&
+                                  index < currentPhaseIndex()
+                                ? theme().success
+                                : theme().textMuted
+                          }
+                        >
+                          {phase() === state()?.phase
+                            ? `${SPINNER[spinnerFrame()]} `
+                            : currentPhaseIndex() >= 0 &&
+                                index < currentPhaseIndex()
+                              ? '● '
+                              : '○ '}
+                          {phase()}
+                        </text>
+                      )}
+                    </Index>
+                  </box>
+                ) : (
+                  // Phases unknown — show workflowName phaseName
+                  <text fg={theme().text}>
                     <b>{state()?.workflow}</b>
                     <span style={{ fg: theme().textMuted }}>
                       {' '}
                       {state()?.phase}
                     </span>
-                  </span>
-                ) : (
-                  // Expanded + active: ▼ Workflow workflowName
-                  <span>
-                    {'▼ '}
-                    <b>Workflow</b> {state()?.workflow}
-                  </span>
+                  </text>
                 )
-              ) : (
-                // No active workflow
-                // eslint-disable-next-line solid/style-prop -- `fg` is an OpenTUI-specific style prop, not a standard CSS property
-                <b>Workflow</b>
-              )}
-            </text>
-            {/* Expanded phase list */}
-            {!collapsed() && state() ? (
-              (state()?.phases ?? []).length > 0 ? (
-                <box flexDirection="column">
-                  <Index each={state()?.phases ?? []}>
-                    {(phase, index) => (
-                      <text
-                        fg={
-                          phase() === state()?.phase
-                            ? theme().warning
-                            : currentPhaseIndex() >= 0 &&
-                                index < currentPhaseIndex()
-                              ? theme().success
-                              : theme().textMuted
-                        }
-                      >
-                        {phase() === state()?.phase
-                          ? `${SPINNER[spinnerFrame()]} `
-                          : currentPhaseIndex() >= 0 &&
-                              index < currentPhaseIndex()
-                            ? '● '
-                            : '○ '}
-                        {phase()}
-                      </text>
-                    )}
-                  </Index>
-                </box>
-              ) : (
-                // Phases unknown — show workflowName phaseName
-                <text fg={theme().text}>
-                  <b>{state()?.workflow}</b>
-                  <span style={{ fg: theme().textMuted }}>
-                    {' '}
-                    {state()?.phase}
-                  </span>
-                </text>
-              )
-            ) : null}
-            {/* No active workflow message */}
-            {!state() ? (
-              <text fg={theme().textMuted}>No Active Workflow</text>
-            ) : null}
-          </box>
+              ) : null}
+              {/* No active workflow message */}
+              {!state() ? (
+                <text fg={theme().textMuted}>No Active Workflow</text>
+              ) : null}
+            </box>
+          )
         );
       },
     },

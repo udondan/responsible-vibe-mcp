@@ -35,6 +35,19 @@ The plugin works with both integration modes:
 | **opencode-plugin** (direct) | `start_development`, `proceed_to_phase`, `conduct_review`, `reset_development`, `setup_project_docs`                                                   |
 | **MCP server**               | `workflows_start_development`, `workflows_proceed_to_phase`, `workflows_conduct_review`, `workflows_reset_development`, `workflows_setup_project_docs` |
 
+## Configuration
+
+### Agent filtering
+
+By default the sidebar widget is visible for all agents. Set `WORKFLOW_ACTIVE_AGENTS` to a comma-separated list of agent names to show it only for those agents:
+
+```bash
+# Only show the workflow widget when the "coder" or "architect" agent is active
+WORKFLOW_ACTIVE_AGENTS=coder,architect
+```
+
+This uses the same env var as the `@codemcp/workflows-opencode` plugin, so both plugins respond consistently to the same configuration.
+
 ## Local development
 
 To test the plugin locally before publishing, point `tui.json` at the absolute path to this package:

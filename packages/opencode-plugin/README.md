@@ -79,6 +79,29 @@ Or for local development:
 
 Integrated with `@codemcp/workflows-core` for real state management and phase-based file restrictions.
 
+## Configuration
+
+### Agent filtering
+
+By default the plugin is active for all agents. Set `WORKFLOW_ACTIVE_AGENTS` to a comma-separated list of agent names to restrict it to specific agents only:
+
+```bash
+# Only activate for the "coder" and "architect" agents
+WORKFLOW_ACTIVE_AGENTS=coder,architect
+```
+
+When the env var is set, hooks and tool-call enforcement are silently skipped for any agent not in the list. This prevents subagents (Tasks) from being interrupted by workflow instructions when they are not expected to follow the workflow.
+
+### Session-level override
+
+Use the `/workflow` command to toggle the plugin on or off for the current session, regardless of the agent filter:
+
+```
+/workflow off   # disable for this session
+/workflow on    # re-enable for this session
+/workflow       # show current state
+```
+
 ## Related
 
 - [`@codemcp/workflows-core`](../core) — The workflow engine (shared with MCP server)
