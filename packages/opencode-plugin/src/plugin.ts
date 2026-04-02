@@ -114,10 +114,40 @@ export const WorkflowsPlugin: Plugin = async (
     worktree: input.worktree,
   });
 
-  // Initialize workflows enabled state from environment variable
-  const envWorkflows = process.env.WORKFLOW?.toLowerCase();
-  let workflowsEnabled = envWorkflows === 'off' ? false : true; // default: enabled
-  logger.info('Workflows state initialized', { workflowsEnabled });
+  // Parse WORKFLOW_ACTIVE_AGENTS env var: comma-separated list of agent names.
+  // When set, workflows only activate for agents in that list.
+  // When not set (or empty), workflows activate for all agents (default).
+  const envActiveAgents = process.env.WORKFLOW_ACTIVE_AGENTS;
+  const activeAgentFilter: Set<string> | null =
+    envActiveAgents && envActiveAgents.trim()
+      ? new Set(
+          envActiveAgents
+            .split(',')
+            .map(a => a.trim().toLowerCase())
+            .filter(Boolean)
+        )
+      : null; // null = no filter, all agents active
+
+  // Session-level override: /workflow on|off works on top of the agent filter.
+  // Starts as true so the agent filter alone controls whether hooks fire.
+  let workflowsEnabled = true;
+
+  /**
+   * Returns true if workflows should run for the given agent name,
+   * taking both the session-level override and the agent filter into account.
+   */
+  function isActiveForAgent(agent: string | undefined): boolean {
+    if (!workflowsEnabled) return false;
+    if (activeAgentFilter === null) return true; // no filter → all agents
+    return activeAgentFilter.has((agent ?? '').toLowerCase());
+  }
+
+  logger.info('Workflows state initialized', {
+    activeAgentFilter: activeAgentFilter
+      ? [...activeAgentFilter]
+      : 'all (no filter)',
+    workflowsEnabled,
+  });
 
   // Initialize instruction generator
   const planManager = new PlanManager();
@@ -138,11 +168,15 @@ export const WorkflowsPlugin: Plugin = async (
   // Consumed and cleared by the next chat.message hook call.
   let bufferedInstructions: BufferedInstructions | null = null;
 
+  // Track the most recent agent name seen in chat.message per session.
+  // Used to gate tool.execute.before, which doesn't carry an agent field.
+  const sessionAgents = new Map<string, string>();
+
   /**
    * Set buffered instructions from a tool result.
    * The next chat.message hook will use these instead of calling WhatsNextHandler.
    */
-  function setBufferedInstructions(result: WhatsNextResult) {
+  function setBufferedInstructions(result: WhatsNextResult): void {
     bufferedInstructions = {
       phase: result.phase,
       instructions: result.instructions,
@@ -260,11 +294,19 @@ export const WorkflowsPlugin: Plugin = async (
             newSessionId: currentSessionId,
           });
         }
+
+        // Track the agent for this session so tool.execute.before can use it
+        if (hookInput.agent) {
+          sessionAgents.set(hookInput.sessionID, hookInput.agent);
+        }
       }
 
-      // Skip if workflows are disabled
-      if (!workflowsEnabled) {
-        logger.debug('chat.message: Workflows disabled, skipping hook');
+      // Skip if workflows are disabled or agent is not in the active list
+      if (!isActiveForAgent(hookInput.agent)) {
+        logger.info(
+          'chat.message: Workflows inactive for agent, skipping hook',
+          { agent: hookInput.agent }
+        );
         return;
       }
 
@@ -365,11 +407,18 @@ export const WorkflowsPlugin: Plugin = async (
     /**
      * Hook 2: tool.execute.before
      * Fires before each tool execution. We block disallowed file edits based on phase.
+     *
+     * Note: tool.execute.before does not carry an agent field. We use the agent
+     * last seen in chat.message for the same session (stored in sessionAgents).
      */
     'tool.execute.before': async (hookInput, output) => {
-      // Skip if workflows are disabled
-      if (!workflowsEnabled) {
-        logger.debug('tool.execute.before: Workflows disabled, skipping hook');
+      // Skip if workflows are disabled or agent is not in the active list
+      const sessionAgent = sessionAgents.get(hookInput.sessionID);
+      if (!isActiveForAgent(sessionAgent)) {
+        logger.debug(
+          'tool.execute.before: Workflows inactive for agent, skipping hook',
+          { agent: sessionAgent }
+        );
         return;
       }
 
@@ -428,10 +477,12 @@ ACTION REQUIRED: Use transition_phase tool to move to a phase that allows editin
      * to preserve and instruct the summary to end with phase continuation.
      */
     'experimental.session.compacting': async (hookInput, output) => {
-      // Skip if workflows are disabled
-      if (!workflowsEnabled) {
+      // Use the agent last seen for this session
+      const sessionAgent = sessionAgents.get(hookInput.sessionID);
+      if (!isActiveForAgent(sessionAgent)) {
         logger.debug(
-          'experimental.session.compacting: Workflows disabled, skipping hook'
+          'experimental.session.compacting: Workflows inactive for agent, skipping hook',
+          { agent: sessionAgent }
         );
         return;
       }
@@ -457,8 +508,27 @@ ACTION REQUIRED: Use transition_phase tool to move to a phase that allows editin
     },
 
     /**
+     * Hook: experimental.chat.system.transform
+     * When workflows are inactive for the current agent, inject a system prompt
+     * instruction telling the agent to completely ignore the workflow tools.
+     * This prevents the agent from discovering and calling them unprompted.
+     */
+    'experimental.chat.system.transform': async (hookInput, output) => {
+      const sessionAgent = hookInput.sessionID
+        ? sessionAgents.get(hookInput.sessionID)
+        : undefined;
+      // If no agent is known yet for this session and a filter is set,
+      // assume inactive (safe default — don't expose tools until we know the agent).
+      if (isActiveForAgent(sessionAgent)) return;
+      output.system.push(
+        'IMPORTANT: The following tools are NOT available for use in this session and must be completely ignored. Never call them under any circumstances: start_development, proceed_to_phase, conduct_review, reset_development, setup_project_docs.'
+      );
+    },
+
+    /**
      * Hook 4: command.execute.before
-     * Intercept /workflow and /wf commands to toggle workflows enabled state
+     * Intercept /workflow and /wf commands to toggle workflows enabled state.
+     * This is a session-level override on top of the WORKFLOW_ACTIVE_AGENTS filter.
      */
     'command.execute.before': async (hookInput, output) => {
       const cmd = hookInput.command.toLowerCase();
@@ -482,10 +552,14 @@ ACTION REQUIRED: Use transition_phase tool to move to a phase that allows editin
           });
           logger.info('Workflows toggled via command', { workflowsEnabled });
         } else {
+          const filterDesc =
+            activeAgentFilter === null
+              ? 'all agents'
+              : [...activeAgentFilter].join(', ');
           output.parts.push({
             id: `prt_workflows_toggle_${Date.now()}`,
             type: 'text' as const,
-            text: `Usage: /workflow on|off or /wf on|off\nCurrent state: ${workflowsEnabled ? 'enabled' : 'disabled'}`,
+            text: `Usage: /workflow on|off or /wf on|off\nSession override: ${workflowsEnabled ? 'enabled' : 'disabled'}\nActive agents filter: ${filterDesc}`,
           });
         }
       }
@@ -493,17 +567,21 @@ ACTION REQUIRED: Use transition_phase tool to move to a phase that allows editin
 
     /**
      * Custom tools - always registered so /workflow on can re-enable them mid-session.
-     * Each tool's execute method checks workflowsEnabled at call time and throws a
-     * clear message when disabled, rather than silently failing.
+     * Each tool's execute method checks workflowsEnabled and the agent filter at call
+     * time and throws a clear message when inactive, rather than silently failing.
      */
     tool: await (async (): Promise<{ [key: string]: ToolDefinition }> => {
       const DISABLED_MSG =
-        'Workflows are disabled (WORKFLOW=off). Enable with /workflow on or /wf on';
+        'Workflows are disabled (/workflow off). Enable with /workflow on or /wf on';
+      const AGENT_MSG = 'Workflow tools are not active for the current agent.';
       const wrap = (def: ToolDefinition): ToolDefinition => ({
         ...def,
         execute: async (args, ctx) => {
           if (!workflowsEnabled) {
             throw new Error(DISABLED_MSG);
+          }
+          if (!isActiveForAgent(ctx.agent)) {
+            throw new Error(AGENT_MSG);
           }
           return def.execute(args, ctx);
         },
