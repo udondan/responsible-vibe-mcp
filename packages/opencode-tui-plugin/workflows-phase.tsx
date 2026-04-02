@@ -261,9 +261,32 @@ function parseActiveAgentFilter(): Set<string> | null {
   );
 }
 
-// Module-level map so session overrides survive sidebar remounts.
-const sessionOverrideMap = new Map<string, boolean>();
+class BoundedSessionOverrideMap extends Map<string, boolean> {
+  constructor(private readonly maxEntries: number) {
+    super();
+  }
 
+  override set(key: string, value: boolean): this {
+    if (super.has(key)) {
+      super.delete(key);
+    }
+
+    super.set(key, value);
+
+    if (this.size > this.maxEntries) {
+      const oldestKey = this.keys().next().value as string | undefined;
+      if (oldestKey !== undefined) {
+        super.delete(oldestKey);
+      }
+    }
+
+    return this;
+  }
+}
+
+// Module-level map so session overrides survive sidebar remounts, but bounded to
+// avoid unbounded growth across many sessions.
+const sessionOverrideMap = new BoundedSessionOverrideMap(500);
 // eslint-disable-next-line @typescript-eslint/require-await -- TuiPlugin signature requires Promise<void>; plugin body is synchronous
 const tui: TuiPlugin = async api => {
   const activeAgentFilter = parseActiveAgentFilter();
