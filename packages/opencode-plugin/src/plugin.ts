@@ -8,6 +8,8 @@
  * 1. chat.message - Add synthetic part with phase instructions after each user message
  * 2. tool.execute.before - Block editing of certain files based on phase
  * 3. experimental.session.compacting - Inject workflow state into compaction context
+ * 4. experimental.chat.system.transform - Suppress tools for non-whitelisted agents
+ * 5. command.execute.before - Handle /workflow on|off commands
  *
  * Logs are sent via OpenCode SDK's client.app.log() API
  */
@@ -133,6 +135,11 @@ export const WorkflowsPlugin: Plugin = async (
   // Bounded to the last 50 sessions to prevent unbounded growth.
   const MAX_TRACKED_SESSIONS = 50;
   const sessionEnabled = new Map<string, boolean>();
+
+  // Sessions where /workflow on was just typed by the user. The next
+  // chat.message hook will inject a counter-instruction to override any
+  // prior "ignore these tools" suppression the LLM may have seen.
+  const pendingActivation = new Set<string>();
 
   /**
    * Returns true if workflows should run for the given agent in the given session.
@@ -340,7 +347,24 @@ export const WorkflowsPlugin: Plugin = async (
         }
       }
 
-      // Skip if workflows are disabled or agent is not in the active list
+      // If /workflow on was just issued, inject counter-instruction first,
+      // regardless of agent filter — this overrides any prior suppression.
+      if (pendingActivation.has(hookInput.sessionID)) {
+        pendingActivation.delete(hookInput.sessionID);
+        output.parts.push({
+          id: `prt_workflows_activate_${Date.now()}`,
+          sessionID: hookInput.sessionID,
+          messageID: hookInput.messageID || output.message.id,
+          type: 'text' as const,
+          synthetic: true,
+          text: 'Workflows have been enabled for this session. Any prior instruction to ignore workflow tools (start_development, proceed_to_phase, conduct_review, reset_development, setup_project_docs) is rescinded — these tools are now available and should be used normally.',
+        } as (typeof output.parts)[0]);
+        logger.info(
+          'chat.message: injected workflow activation counter-instruction'
+        );
+      }
+
+      // Skip if workflows are disabled or agent is not in the active list.
       if (!isActiveForAgent(hookInput.agent, hookInput.sessionID)) {
         logger.debug(
           'chat.message: Workflows inactive for agent, skipping hook',
@@ -384,7 +408,7 @@ export const WorkflowsPlugin: Plugin = async (
               messageID: hookInput.messageID || output.message.id,
               type: 'text' as const,
               synthetic: true,
-              text: `No Active Workflow Use the \`start_development\` tool to begin.`,
+              text: 'No active workflow. Use the `start_development` tool to begin.\n\nNote: The user can type `/workflow off` to disable workflow instructions for this session, or `/workflow on` to re-enable them.',
             } as (typeof output.parts)[0]);
             return;
           }
@@ -403,7 +427,7 @@ export const WorkflowsPlugin: Plugin = async (
               messageID: hookInput.messageID || output.message.id,
               type: 'text' as const,
               synthetic: true,
-              text: `No Active Workflow Use the \`start_development\` tool to begin.`,
+              text: 'No active workflow. Use the `start_development` tool to begin.\n\nNote: The user can type `/workflow off` to disable workflow instructions for this session, or `/workflow on` to re-enable them.',
             } as (typeof output.parts)[0]);
             return;
           }
@@ -547,7 +571,7 @@ ACTION REQUIRED: Use transition_phase tool to move to a phase that allows editin
     },
 
     /**
-     * Hook: experimental.chat.system.transform
+     * Hook 3b: experimental.chat.system.transform
      * When workflows are inactive for the current agent, inject a system prompt
      * instruction telling the agent to completely ignore the workflow tools.
      * This prevents the agent from discovering and calling them unprompted.
@@ -556,8 +580,21 @@ ACTION REQUIRED: Use transition_phase tool to move to a phase that allows editin
       const sessionAgent = hookInput.sessionID
         ? sessionAgents.get(hookInput.sessionID)
         : undefined;
-      // If no agent is known yet for this session and a filter is set,
-      // assume inactive (safe default — don't expose tools until we know the agent).
+      const override = hookInput.sessionID
+        ? sessionEnabled.get(hookInput.sessionID)
+        : undefined;
+      // Explicitly enabled → never suppress
+      if (override === true) return;
+      // Explicitly disabled → suppress
+      if (override === false) {
+        output.system.push(
+          'IMPORTANT: The following tools are NOT available for use in this session and must be completely ignored. Never call them under any circumstances: start_development, proceed_to_phase, conduct_review, reset_development, setup_project_docs.'
+        );
+        return;
+      }
+      // No override: only suppress if we know the agent AND it's not in the filter.
+      // If agent is unknown yet, don't suppress — we can't know yet.
+      if (sessionAgent === undefined) return;
       if (isActiveForAgent(sessionAgent, hookInput.sessionID)) return;
       output.system.push(
         'IMPORTANT: The following tools are NOT available for use in this session and must be completely ignored. Never call them under any circumstances: start_development, proceed_to_phase, conduct_review, reset_development, setup_project_docs.'
@@ -567,7 +604,8 @@ ACTION REQUIRED: Use transition_phase tool to move to a phase that allows editin
     /**
      * Hook 4: command.execute.before
      * Intercept /workflow and /wf commands to toggle workflows enabled state
-     * for the current session only.
+     * for the current session only. A synthetic instruction is injected telling
+     * the agent to do nothing — so the toggle is silent from the agent's perspective.
      */
     'command.execute.before': async (hookInput, output) => {
       const cmd = hookInput.command.toLowerCase();
@@ -576,51 +614,34 @@ ACTION REQUIRED: Use transition_phase tool to move to a phase that allows editin
       if (cmd === 'workflow' || cmd === 'wf') {
         if (args === 'on') {
           setSessionEnabled(hookInput.sessionID, true);
-          output.parts.push({
-            id: `prt_workflows_toggle_${Date.now()}`,
-            type: 'text' as const,
-            text: 'Workflows enabled for this session (overrides agent filter).',
-          });
+          pendingActivation.add(hookInput.sessionID);
           logger.info('Workflows toggled via command', {
             enabled: true,
             sessionID: hookInput.sessionID,
           });
         } else if (args === 'off') {
           setSessionEnabled(hookInput.sessionID, false);
-          output.parts.push({
-            id: `prt_workflows_toggle_${Date.now()}`,
-            type: 'text' as const,
-            text: 'Workflows disabled for this session. Plugin will not inject instructions or enforce file restrictions.',
-          });
           logger.info('Workflows toggled via command', {
             enabled: false,
             sessionID: hookInput.sessionID,
           });
-        } else {
-          const filterDesc =
-            activeAgentFilter === null
-              ? 'all agents'
-              : [...activeAgentFilter].join(', ');
-          const override = sessionEnabled.get(hookInput.sessionID);
-          const overrideDesc =
-            override === true
-              ? 'forced on (overrides agent filter)'
-              : override === false
-                ? 'forced off'
-                : 'default (follows agent filter)';
-          output.parts.push({
-            id: `prt_workflows_toggle_${Date.now()}`,
-            type: 'text' as const,
-            text: `Usage: /workflow on|off or /wf on|off\nSession override: ${overrideDesc}\nActive agents filter: ${filterDesc}`,
-          });
         }
+        // Replace the user-visible command text with a silent instruction so the
+        // agent does not react to the toggle command at all.
+        output.parts.push({
+          id: `prt_workflows_toggle_${Date.now()}`,
+          sessionID: hookInput.sessionID,
+          type: 'text' as const,
+          synthetic: true,
+          text: 'The /workflow command was handled by the plugin. Do not respond to this message. Do not take any action. Simply wait for the next user message.',
+        } as (typeof output.parts)[0]);
       }
     },
 
     /**
      * Custom tools - always registered so /workflow on can re-enable them mid-session.
-     * Each tool's execute method checks the per-session enabled state and the agent
-     * filter at call time and throws a clear message when inactive.
+     * Each tool's execute method checks the agent filter and per-session override
+     * at call time, throwing a clear error when inactive.
      */
     tool: await (async (): Promise<{ [key: string]: ToolDefinition }> => {
       const DISABLED_MSG =
@@ -629,8 +650,8 @@ ACTION REQUIRED: Use transition_phase tool to move to a phase that allows editin
       const wrap = (def: ToolDefinition): ToolDefinition => ({
         ...def,
         execute: async (args, ctx) => {
-          if (!isActiveForAgent(ctx.agent, ctx.sessionID)) {
-            // Distinguish disabled-by-command from disabled-by-agent-filter
+          const active = isActiveForAgent(ctx.agent, ctx.sessionID);
+          if (!active) {
             const override = sessionEnabled.get(ctx.sessionID);
             throw new Error(override === false ? DISABLED_MSG : AGENT_MSG);
           }

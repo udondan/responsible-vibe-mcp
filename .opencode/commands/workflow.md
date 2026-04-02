@@ -9,10 +9,14 @@ Toggle workflows for the current session:
 - `/wf on` - Enable workflows (shorthand)
 - `/wf off` - Disable workflows (shorthand)
 
-When workflows are disabled, the plugin will not inject development instructions or enforce file edit restrictions.
+The override is per-session only and resets when the session ends.
 
-You can also set the initial state via environment variable:
+---
+
+You can also restrict which agents have workflows active by default via `WORKFLOW_ACTIVE_AGENTS`:
 
 ```bash
-WORKFLOW=off opencode
+WORKFLOW_ACTIVE_AGENTS=agent1,agent2,agentN opencode
 ```
+
+When not set, workflows are active for all agents. `/workflow on` overrides this for the current session.
