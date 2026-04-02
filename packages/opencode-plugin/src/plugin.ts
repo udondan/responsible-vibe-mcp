@@ -135,15 +135,21 @@ export const WorkflowsPlugin: Plugin = async (
   const sessionEnabled = new Map<string, boolean>();
 
   /**
-   * Returns true if workflows should run for the given agent in the given session,
-   * taking both the per-session on/off override and the agent filter into account.
+   * Returns true if workflows should run for the given agent in the given session.
+   *
+   * Logic:
+   *   - If the session was explicitly disabled (/workflow off) → false
+   *   - If the session was explicitly enabled (/workflow on)   → true (overrides agent filter)
+   *   - Otherwise (default): apply the agent filter
    */
   function isActiveForAgent(
     agent: string | undefined,
     sessionID: string | undefined
   ): boolean {
-    const enabled = sessionID ? (sessionEnabled.get(sessionID) ?? true) : true;
-    if (!enabled) return false;
+    const override = sessionID ? sessionEnabled.get(sessionID) : undefined;
+    if (override === false) return false; // explicitly disabled
+    if (override === true) return true; // explicitly enabled → bypass agent filter
+    // No override: apply agent filter (undefined = follow filter)
     if (activeAgentFilter === null) return true; // no filter → all agents
     return activeAgentFilter.has((agent ?? '').toLowerCase());
   }
@@ -568,7 +574,7 @@ ACTION REQUIRED: Use transition_phase tool to move to a phase that allows editin
           output.parts.push({
             id: `prt_workflows_toggle_${Date.now()}`,
             type: 'text' as const,
-            text: 'Workflows enabled for this session.',
+            text: 'Workflows enabled for this session (overrides agent filter).',
           });
           logger.info('Workflows toggled via command', {
             enabled: true,
@@ -590,11 +596,17 @@ ACTION REQUIRED: Use transition_phase tool to move to a phase that allows editin
             activeAgentFilter === null
               ? 'all agents'
               : [...activeAgentFilter].join(', ');
-          const enabled = sessionEnabled.get(hookInput.sessionID) ?? true;
+          const override = sessionEnabled.get(hookInput.sessionID);
+          const overrideDesc =
+            override === true
+              ? 'forced on (overrides agent filter)'
+              : override === false
+                ? 'forced off'
+                : 'default (follows agent filter)';
           output.parts.push({
             id: `prt_workflows_toggle_${Date.now()}`,
             type: 'text' as const,
-            text: `Usage: /workflow on|off or /wf on|off\nSession override: ${enabled ? 'enabled' : 'disabled'}\nActive agents filter: ${filterDesc}`,
+            text: `Usage: /workflow on|off or /wf on|off\nSession override: ${overrideDesc}\nActive agents filter: ${filterDesc}`,
           });
         }
       }
@@ -614,8 +626,8 @@ ACTION REQUIRED: Use transition_phase tool to move to a phase that allows editin
         execute: async (args, ctx) => {
           if (!isActiveForAgent(ctx.agent, ctx.sessionID)) {
             // Distinguish disabled-by-command from disabled-by-agent-filter
-            const enabled = sessionEnabled.get(ctx.sessionID) ?? true;
-            throw new Error(enabled ? AGENT_MSG : DISABLED_MSG);
+            const override = sessionEnabled.get(ctx.sessionID);
+            throw new Error(override === false ? DISABLED_MSG : AGENT_MSG);
           }
           return def.execute(args, ctx);
         },
